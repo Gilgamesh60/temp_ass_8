@@ -20,9 +20,23 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import socket
 import time
 from pathlib import Path
+
+# --- Ensure Java is findable (macOS Homebrew installs don't add to PATH) ---
+if not shutil.which("java"):
+    for java_path in [
+        "/opt/homebrew/opt/openjdk@17",
+        "/usr/local/opt/openjdk@17",
+        "/opt/homebrew/opt/openjdk",
+        "/usr/local/opt/openjdk",
+    ]:
+        if os.path.isfile(f"{java_path}/bin/java"):
+            os.environ["JAVA_HOME"] = java_path
+            os.environ["PATH"] = f"{java_path}/bin:" + os.environ.get("PATH", "")
+            break
 
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import DoubleType
