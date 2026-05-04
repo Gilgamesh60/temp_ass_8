@@ -80,6 +80,8 @@ def build_spark(master: str | None, app_name: str = "SparkClean") -> SparkSessio
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         # Pin timezone so pickup_hour matches Ray (pd.to_datetime is naive/UTC).
         .config("spark.sql.session.timeZone", "UTC")
+        # NYC TLC 2022 has "Airport_fee", 2023 has "airport_fee" — ignore case.
+        .config("spark.sql.caseSensitive", "false")
     )
     if master:
         builder = builder.master(master)
