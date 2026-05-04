@@ -39,13 +39,37 @@ if not shutil.which("java"):
             break
 
 from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.types import DoubleType
+from pyspark.sql.types import DoubleType, LongType, StringType, StructField, StructType, TimestampNTZType
 
 TRIPS_GLOB = "./data/trips/*.parquet"
 ZONES_CSV = "./data/zones/taxi_zone_lookup.csv"
 OUTPUT_DIR = "./output/spark_result"
 AGG_OUTPUT_DIR = "./output/spark_agg"
 METRICS_FILE_DEFAULT = "./metrics/spark_metrics.json"
+
+# Explicit schema that works across all NYC TLC years (2022 uses INT, 2023 uses BIGINT).
+# We unify everything to the widest compatible type.
+TRIP_SCHEMA = StructType([
+    StructField("VendorID", LongType(), True),
+    StructField("tpep_pickup_datetime", TimestampNTZType(), True),
+    StructField("tpep_dropoff_datetime", TimestampNTZType(), True),
+    StructField("passenger_count", DoubleType(), True),
+    StructField("trip_distance", DoubleType(), True),
+    StructField("RatecodeID", DoubleType(), True),
+    StructField("store_and_fwd_flag", StringType(), True),
+    StructField("PULocationID", LongType(), True),
+    StructField("DOLocationID", LongType(), True),
+    StructField("payment_type", LongType(), True),
+    StructField("fare_amount", DoubleType(), True),
+    StructField("extra", DoubleType(), True),
+    StructField("mta_tax", DoubleType(), True),
+    StructField("tip_amount", DoubleType(), True),
+    StructField("tolls_amount", DoubleType(), True),
+    StructField("improvement_surcharge", DoubleType(), True),
+    StructField("total_amount", DoubleType(), True),
+    StructField("congestion_surcharge", DoubleType(), True),
+    StructField("airport_fee", DoubleType(), True),
+])
 
 
 def build_spark(master: str | None, app_name: str = "SparkClean") -> SparkSession:
@@ -54,8 +78,6 @@ def build_spark(master: str | None, app_name: str = "SparkClean") -> SparkSessio
         .config("spark.sql.shuffle.partitions", "16")
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-        # NYC TLC parquet schemas drift slightly across months; merge them.
-        .config("spark.sql.parquet.mergeSchema", "true")
         # Pin timezone so pickup_hour matches Ray (pd.to_datetime is naive/UTC).
         .config("spark.sql.session.timeZone", "UTC")
     )
@@ -101,7 +123,9 @@ def main():
 
     # --- 1. INGEST -----------------------------------------------------------
     t0 = time.perf_counter()
-    trips = spark.read.option("mergeSchema", "true").parquet(args.trips)
+    # Use explicit schema to handle type drift across NYC TLC years (INT vs BIGINT)
+    # and column name case differences (airport_fee vs Airport_fee).
+    trips = spark.read.schema(TRIP_SCHEMA).parquet(args.trips)
     zones = (
         spark.read.option("header", "true")
         .option("inferSchema", "true")
