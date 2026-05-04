@@ -1,0 +1,12 @@
+data/
+output/
+metrics/
+figs/
+screenshots/*.tmp
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+build.log
+*.part

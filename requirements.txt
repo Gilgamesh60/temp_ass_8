@@ -1,0 +1,8 @@
+pyspark==3.5.1
+ray[data]==2.10.0
+pandas>=2.1
+pyarrow>=14
+numpy>=1.26
+matplotlib>=3.8
+requests>=2.31
+tqdm>=4.66
