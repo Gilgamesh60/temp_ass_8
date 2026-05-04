@@ -69,6 +69,8 @@ def build_spark(master: str | None, app_name: str = "SparkClean") -> SparkSessio
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .config("spark.sql.session.timeZone", "UTC")
+        .config("spark.driver.memory", "4g")
+        .config("spark.executor.memory", "4g")
     )
     if master:
         builder = builder.master(master)
