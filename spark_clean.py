@@ -9,14 +9,12 @@ Pipeline:
   5. Aggregate: mean speed by (pickup_hour, Borough)
   6. Export to parquet
 
-Metrics captured in metrics/<label>_spark_metrics.json:
-  - total wall time
-  - per-phase times (ingest / clean / join / udf / aggregate / export)
-  - input / cleaned / joined / aggregated row counts
+Metrics captured in metrics/spark_metrics.json.
 """
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import platform
@@ -24,6 +22,7 @@ import shutil
 import socket
 import time
 from pathlib import Path
+from functools import reduce
 
 # --- Ensure Java is findable (macOS Homebrew installs don't add to PATH) ---
 if not shutil.which("java"):
@@ -38,8 +37,8 @@ if not shutil.which("java"):
             os.environ["PATH"] = f"{java_path}/bin:" + os.environ.get("PATH", "")
             break
 
-from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.types import DoubleType, LongType, StringType, StructField, StructType, TimestampNTZType
+from pyspark.sql import SparkSession, DataFrame, functions as F
+from pyspark.sql.types import DoubleType
 
 TRIPS_GLOB = "./data/trips/*.parquet"
 ZONES_CSV = "./data/zones/taxi_zone_lookup.csv"
@@ -47,29 +46,20 @@ OUTPUT_DIR = "./output/spark_result"
 AGG_OUTPUT_DIR = "./output/spark_agg"
 METRICS_FILE_DEFAULT = "./metrics/spark_metrics.json"
 
-# Explicit schema that works across all NYC TLC years (2022 uses INT, 2023 uses BIGINT).
-# We unify everything to the widest compatible type.
-TRIP_SCHEMA = StructType([
-    StructField("VendorID", LongType(), True),
-    StructField("tpep_pickup_datetime", TimestampNTZType(), True),
-    StructField("tpep_dropoff_datetime", TimestampNTZType(), True),
-    StructField("passenger_count", DoubleType(), True),
-    StructField("trip_distance", DoubleType(), True),
-    StructField("RatecodeID", DoubleType(), True),
-    StructField("store_and_fwd_flag", StringType(), True),
-    StructField("PULocationID", LongType(), True),
-    StructField("DOLocationID", LongType(), True),
-    StructField("payment_type", LongType(), True),
-    StructField("fare_amount", DoubleType(), True),
-    StructField("extra", DoubleType(), True),
-    StructField("mta_tax", DoubleType(), True),
-    StructField("tip_amount", DoubleType(), True),
-    StructField("tolls_amount", DoubleType(), True),
-    StructField("improvement_surcharge", DoubleType(), True),
-    StructField("total_amount", DoubleType(), True),
-    StructField("congestion_surcharge", DoubleType(), True),
-    StructField("airport_fee", DoubleType(), True),
-])
+# The only columns we actually use. We select + cast these from every file,
+# which sidesteps all schema drift issues (INT vs BIGINT, Airport_fee vs airport_fee).
+KEEP_COLS = {
+    "VendorID": "long",
+    "tpep_pickup_datetime": "timestamp",
+    "tpep_dropoff_datetime": "timestamp",
+    "passenger_count": "double",
+    "trip_distance": "double",
+    "PULocationID": "long",
+    "DOLocationID": "long",
+    "payment_type": "long",
+    "fare_amount": "double",
+    "total_amount": "double",
+}
 
 
 def build_spark(master: str | None, app_name: str = "SparkClean") -> SparkSession:
@@ -78,14 +68,26 @@ def build_spark(master: str | None, app_name: str = "SparkClean") -> SparkSessio
         .config("spark.sql.shuffle.partitions", "16")
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-        # Pin timezone so pickup_hour matches Ray (pd.to_datetime is naive/UTC).
         .config("spark.sql.session.timeZone", "UTC")
-        # NYC TLC 2022 has "Airport_fee", 2023 has "airport_fee" — ignore case.
-        .config("spark.sql.caseSensitive", "false")
     )
     if master:
         builder = builder.master(master)
     return builder.getOrCreate()
+
+
+def load_and_normalize(spark: SparkSession, path: str) -> DataFrame:
+    """Read one parquet file, select only the columns we need, cast to uniform types."""
+    df = spark.read.parquet(path)
+    # Lowercase all column names to handle Airport_fee vs airport_fee
+    for c in df.columns:
+        df = df.withColumnRenamed(c, c.lower())
+    # Select and cast only what we need
+    selects = []
+    for col_name, col_type in KEEP_COLS.items():
+        lc = col_name.lower()
+        if lc in [c.lower() for c in df.columns]:
+            selects.append(F.col(lc).cast(col_type).alias(col_name))
+    return df.select(selects)
 
 
 # --- Python UDF: intentionally a plain Python function, NOT a pandas_udf,
@@ -125,9 +127,13 @@ def main():
 
     # --- 1. INGEST -----------------------------------------------------------
     t0 = time.perf_counter()
-    # Use explicit schema to handle type drift across NYC TLC years (INT vs BIGINT)
-    # and column name case differences (airport_fee vs Airport_fee).
-    trips = spark.read.schema(TRIP_SCHEMA).parquet(args.trips)
+    # Read each parquet file individually, normalize columns, then union.
+    # This is the bulletproof way to handle NYC TLC schema drift across years.
+    files = sorted(glob.glob(args.trips))
+    print(f"[ingest]  found {len(files)} parquet files")
+    dfs = [load_and_normalize(spark, f) for f in files]
+    trips = reduce(DataFrame.unionByName, dfs)
+
     zones = (
         spark.read.option("header", "true")
         .option("inferSchema", "true")
@@ -162,8 +168,6 @@ def main():
     print(f"[clean]   rows={cleaned_rows:,}  ({phase['cleansing_s']:.1f}s)")
 
     # --- 3. HEAVY JOIN -------------------------------------------------------
-    # Note: we deliberately do NOT broadcast-hint here to keep parity with the
-    # default Ray path and to exercise a real shuffle join on the cluster.
     t0 = time.perf_counter()
     joined = cleaned.join(
         zones,
@@ -185,7 +189,7 @@ def main():
         "pickup_hour", F.hour("pickup_ts")
     )
     with_speed = with_speed.cache()
-    udf_rows = with_speed.count()  # forces UDF evaluation
+    udf_rows = with_speed.count()
     phase["udf_s"] = time.perf_counter() - t0
     print(f"[udf]     rows={udf_rows:,}  ({phase['udf_s']:.1f}s)  <- JVM<->Python overhead")
 
